@@ -26,13 +26,13 @@ class Logger:
             f.write(log_message + '\n')
 
 # --- 2. 数据集类 ---
+# 正确的
 class GollumDataset(Dataset):
     def __init__(self, file_path):
-        # np.load 可以直接加载 .npz 文件，它会返回一个类似字典的对象
-        with np.load(file_path) as data:
-            # 通过我们保存时使用的键来访问数据
-            self.inputs = torch.from_numpy(data['inputs']).float()
-            self.labels = torch.from_numpy(data['labels']).float()
+        data = np.load(file_path)
+        # 使用我们保存时定义的键 'inputs' 和 'labels'
+        self.inputs = torch.from_numpy(data['inputs']).float()
+        self.labels = torch.from_numpy(data['labels']).float()
         print(f"Loaded data from {file_path}. Input shape: {self.inputs.shape}, Label shape: {self.labels.shape}")
 
     def __len__(self):
@@ -46,7 +46,7 @@ def main():
     # --- 配置参数 ---
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     epochs = 100
-    batch_size = 64
+    batch_size = 512
     learning_rate = 1e-3
     output_dir = "checkpoints/gollum_sl"
     log_file = os.path.join(output_dir, "train_log.txt")
@@ -60,14 +60,18 @@ def main():
     config = LTCGollumConfig()
     model = LTCGollum(config)
     model.to(device)
+    # 检查PyTorch版本后，启用编译
+    if torch.__version__[0] == '2':
+        logger.log("PyTorch 2.0+ detected, compiling the model...")
+        model = torch.compile(model)
+        
     logger.log(f"Model created with {sum(p.numel() for p in model.parameters())} parameters.")
-
-    # --- 准备数据 ---
+        # --- 准备数据 ---
     logger.log("Loading dataset...")
     train_dataset = GollumDataset('dataset/gollum_dataset_train.npz')
     val_dataset = GollumDataset('dataset/gollum_dataset_val.npz')
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
 
     # --- 定义优化器和损失函数 ---
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -84,8 +88,17 @@ def main():
             
             optimizer.zero_grad()
             predictions = model(inputs)
-            loss = criterion(predictions, labels)
-            loss.backward() # PyTorch自动处理BPTT
+            loss_weights = torch.tensor([2.0, 1.0, 2.0, 2.0], device=device) # [Energy, Safety, Satisfaction, Trust]
+            # 给Energy, Satisfaction, Trust两倍的权重，Safety保持原权重
+
+            # (predictions - labels)**2 得到每个元素的平方误差
+            squared_errors = (predictions - labels) ** 2
+            # 乘以权重
+            weighted_squared_errors = squared_errors * loss_weights
+            # 求平均得到最终损失
+            loss = torch.mean(weighted_squared_errors)
+
+            loss.backward()
             optimizer.step()
             
             total_train_loss += loss.item()
