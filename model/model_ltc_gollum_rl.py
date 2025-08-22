@@ -82,23 +82,30 @@ class LTCCell(nn.Module):
         w_numerator = w_numerator_inter + w_numerator_sensory
         w_denominator = w_denominator_inter + w_denominator_sensory
         
+
+        
         # 4. 计算时间常数 tau 和稳态电压 v_inf (这是新的向量化逻辑)
         # G_total = G_leak + G_synaptic
-        G_total = self.gleak + w_denominator
-        # tau = Cm / G_total (膜时间常数)
-        tau = self.cm / (G_total + 1e-8)
+        gleak_positive = F.softplus(self.gleak)
+        cm_positive = F.softplus(self.cm)
         
-        # V_inf = (Cm*V_leak*G_leak + I_synaptic) / G_total (稳态电压)
-        # 注意：这里我们使用了一个等价的公式 V_inf = numerator / denominator
-        numerator = self.cm * state + self.gleak * self.vleak + w_numerator
-        denominator = self.cm + G_total
+        # 2. 计算时间常数 tau 和稳态电压 v_inf (使用约束后的参数)
+        G_total = gleak_positive + w_denominator
+        tau = cm_positive / (G_total + 1e-8)
+        
+        # 分母现在也使用约束后的 gleak_positive
+        denominator = cm_positive + G_total
+        
+        # V_inf 的分子也使用约束后的 gleak_positive 和 cm_positive
+        numerator = cm_positive * state + gleak_positive * self.vleak + w_numerator
+        
         v_inf = numerator / (denominator + 1e-8)
         
-        # 5. 使用指数积分器更新状态 (这是对for循环的高效近似)
-        dt = 0.1 # 使用一个小的、固定的积分时间步长
-        # state_new = v_inf + (state_old - v_inf) * exp(-dt/tau)
+        # 3. 使用指数积分器更新状态 (这部分现在变得安全了)
+        dt = 0.1
         next_state = v_inf + (state - v_inf) * torch.exp(-dt / (tau + 1e-8))
         
+        # 4. (可选但推荐) 保持tanh约束作为最后一道防线
         return torch.tanh(next_state)
 
 # -------------------------------------------------------------------
