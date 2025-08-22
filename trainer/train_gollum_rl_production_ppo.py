@@ -261,35 +261,40 @@ class PPO_Trainer:
                     # ===============================================
 
                     # 自动混合精度上下文
-                    with torch.cuda.amp.autocast(enabled=(self.device.type == 'cuda')):
-                        action_probs, state_values = self.model(mb_obs)
-                        dist = Categorical(action_probs)
-                        new_log_probs = dist.log_prob(mb_actions)
-                        entropy = dist.entropy()
-                        
-                        ratio = torch.exp(new_log_probs - mb_log_probs)
+                    # with torch.cuda.amp.autocast(enabled=(self.device.type == 'cuda')):
+                    action_probs, state_values = self.model(mb_obs)
+                    dist = Categorical(action_probs)
+                    new_log_probs = dist.log_prob(mb_actions)
+                    entropy = dist.entropy()
+                    
+                    ratio = torch.exp(new_log_probs - mb_log_probs)
 
-                        surr1 = ratio * mb_advantages
-                        surr2 = torch.clamp(ratio, 1.0 - self.config['clip_epsilon'], 1.0 + self.config['clip_epsilon']) * mb_advantages
-                        actor_loss = -torch.min(surr1, surr2).mean()
+                    surr1 = ratio * mb_advantages
+                    surr2 = torch.clamp(ratio, 1.0 - self.config['clip_epsilon'], 1.0 + self.config['clip_epsilon']) * mb_advantages
+                    actor_loss = -torch.min(surr1, surr2).mean()
 
-                        # 确保state_values是正确的形状以进行广播
-                        state_values = state_values.squeeze()
-                        if state_values.shape != mb_returns.shape:
-                           # 临时调试信息
-                           # print(f"Shape mismatch: returns {mb_returns.shape}, values {state_values.shape}")
-                           state_values = state_values.view_as(mb_returns)
+                    critic_loss_unclipped = (state_values.squeeze() - mb_returns).pow(2)
+                    critic_loss = torch.clamp(critic_loss_unclipped, 0, 1.0).mean() # 将单一样本的损失限制在1.0以内
+                    # 确保state_values是正确的形状以进行广播
+                    state_values = state_values.squeeze()
+                    if state_values.shape != mb_returns.shape:
+                        # 临时调试信息
+                        # print(f"Shape mismatch: returns {mb_returns.shape}, values {state_values.shape}")
+                        state_values = state_values.view_as(mb_returns)
 
-                        critic_loss = (mb_returns - state_values).pow(2).mean()
-                        loss = actor_loss + self.config['value_coef'] * critic_loss - self.config['entropy_coef'] * entropy.mean()
+                    critic_loss = (mb_returns - state_values).pow(2).mean()
+                    loss = actor_loss + self.config['value_coef'] * critic_loss - self.config['entropy_coef'] * entropy.mean()
 
                     # 梯度更新
                     self.optimizer.zero_grad(set_to_none=True)
-                    self.scaler.scale(loss).backward()
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0) # 将阈值设为1.0
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                    # self.scaler.scale(loss).backward()
+                    # self.scaler.unscale_(self.optimizer)
+                    # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0) # 将阈值设为1.0
+                    # self.scaler.step(self.optimizer)
+                    # self.scaler.update()
             
             update_end_time = time.time()
 

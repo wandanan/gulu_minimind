@@ -99,7 +99,7 @@ class LTCCell(nn.Module):
         # state_new = v_inf + (state_old - v_inf) * exp(-dt/tau)
         next_state = v_inf + (state - v_inf) * torch.exp(-dt / (tau + 1e-8))
         
-        return next_state
+        return torch.tanh(next_state)
 
 # -------------------------------------------------------------------
 # Part 2: Specialized Models for Reinforcement Learning
