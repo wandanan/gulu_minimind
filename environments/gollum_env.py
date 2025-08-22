@@ -69,7 +69,7 @@ class GollumEnv(gym.Env):
     def reset(self, seed=None, options=None):
         """重置环境到初始状态"""
         super().reset(seed=seed)
-        
+        self.toy_position = np.array([1.0, 1.0]) + self.np_random.uniform(low=-0.5, high=0.5, size=2)
         self.gollum_position = np.array([0.0, 0.0])
         self._internal_states = np.array([0.8, 0.5, 0.5, 0.5])
         self.current_step = 0
