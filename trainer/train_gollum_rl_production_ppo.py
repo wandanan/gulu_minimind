@@ -226,7 +226,11 @@ class PPO_Trainer:
 
             # 归一化优势
             b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
-            
+            if np.isnan(b_advantages).any() or np.isinf(b_advantages).any() or \
+               np.isnan(b_returns).any() or np.isinf(b_returns).any():
+                print(f"Warning: NaN or Inf detected in advantages or returns at update {update}. Skipping this update.")
+                continue # 跳过这次有问题的更新
+
             # 一次性将所有数据上传到GPU
             try:
                 b_obs_gpu = torch.from_numpy(b_obs).to(self.device)
@@ -282,7 +286,8 @@ class PPO_Trainer:
                     # 梯度更新
                     self.optimizer.zero_grad(set_to_none=True)
                     self.scaler.scale(loss).backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0) # 将阈值设为1.0
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
             
