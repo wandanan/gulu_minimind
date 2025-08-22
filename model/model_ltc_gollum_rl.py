@@ -51,7 +51,7 @@ class LTCCell(nn.Module):
         mues = v_pre - mu
         x = sigma * mues
         return torch.sigmoid(x)
-
+    
     def forward(self, inputs, state):
         v_pre = state
         sensory_x = inputs.unsqueeze(2) 

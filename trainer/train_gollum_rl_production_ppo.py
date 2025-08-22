@@ -134,15 +134,32 @@ class PPO_Trainer:
         print(f"Environment specs: num_actions={self.num_actions}, obs_shape={self.obs_shape}")
         
         ltc_config = LTCGollumConfig(input_size=self.obs_shape[0])
-        self.model = ActorCriticLTC(ltc_config, num_actions=self.num_actions).to(self.device)
+        # 1. 先在CPU上创建原始模型
+        model = ActorCriticLTC(ltc_config, num_actions=self.num_actions)
         
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.config['learning_rate'], eps=1e-5)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.device.type == 'cuda'))
-
+        # 2. 如果有预训练权重，先在CPU上加载
         if self.config['pretrained_path'] and os.path.exists(self.config['pretrained_path']):
-            self.model.load_pretrained_core(self.config['pretrained_path'])
+            # 注意：这里加载权重时，模型和权重都在CPU上，避免JIT的复杂性
+            model.load_pretrained_core(self.config['pretrained_path'])
         else:
             print("Warning: Pretrained model not found or path not specified. Training from scratch.")
+        
+        # 3. 将加载好权重的模型移动到目标设备
+        model.to(self.device)
+
+        # 4. 【关键优化】对已经加载了权重并移动到设备上的模型实例进行JIT编译
+        try:
+            print("Attempting to JIT compile the model...")
+            # torch.jit.script 接收一个nn.Module实例，返回优化后的版本
+            self.model = torch.jit.script(model)
+            print("Model successfully JIT compiled!")
+        except Exception as e:
+            print(f"Warning: JIT compilation failed: {e}. Proceeding without JIT.")
+            self.model = model # 如果编译失败，使用原始的、未经优化的模型
+        
+        # 5. 最后为可能已被JIT编译的模型设置优化器
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.config['learning_rate'], eps=1e-5)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.device.type == 'cuda'))
 
     def compute_advantages_gae(self, rewards, values, dones, gamma, gae_lambda):
         num_steps = rewards.shape[0]
@@ -163,7 +180,7 @@ class PPO_Trainer:
         print(f"--- Starting PPO Training on {self.device} ---")
         start_time = time.time()
         
-        # === Correct Initialization of Storage Arrays ===
+        # === 存储数组初始化 (保持不变) ===
         obs_shape = (self.config['num_steps_per_collect'], self.config['num_envs']) + self.obs_shape
         obs_np = np.zeros(obs_shape, dtype=np.float32)
         actions_np = np.zeros((self.config['num_steps_per_collect'], self.config['num_envs']), dtype=np.int64)
@@ -185,6 +202,7 @@ class PPO_Trainer:
             print(f"\n--- Update {update}/{num_updates} ---")
             collection_start_time = time.time()
             
+            # 1. 数据收集 (与之前相同)
             for step in range(self.config['num_steps_per_collect']):
                 global_step += 1 * self.config['num_envs']
                 obs_np[step] = next_obs
@@ -205,20 +223,37 @@ class PPO_Trainer:
             
             collection_end_time = time.time()
             
+            # 2. 计算最后一个状态的价值 (与之前相同)
             with torch.no_grad():
                 next_obs_tensor = torch.FloatTensor(next_obs).to(self.device)
                 _, _, next_value = self.model.get_action_and_value(next_obs_tensor)
                 values_np[-1] = next_value.cpu().numpy().flatten()
             
+            # 3. 计算优势和回报 (与之前相同)
             advantages, returns = self.compute_advantages_gae(rewards_np, values_np, dones_np, self.config['gamma'], self.config['gae_lambda'])
             
+            # === OPTIMIZATION 1: 一次性数据准备和上传 ===
+            # 将所有Numpy数组扁平化
             b_obs = obs_np.reshape((-1,) + self.obs_shape)
             b_log_probs = log_probs_np.flatten()
             b_actions = actions_np.flatten()
             b_advantages = advantages.flatten()
             b_returns = returns.flatten()
 
+            # 归一化优势
             b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
+            
+            # 一次性将所有数据上传到GPU
+            try:
+                b_obs_gpu = torch.from_numpy(b_obs).to(self.device)
+                b_actions_gpu = torch.from_numpy(b_actions).to(self.device, dtype=torch.long)
+                b_log_probs_gpu = torch.from_numpy(b_log_probs).to(self.device)
+                b_advantages_gpu = torch.from_numpy(b_advantages).to(self.device)
+                b_returns_gpu = torch.from_numpy(b_returns).to(self.device)
+            except Exception as e:
+                print(f"Error during data upload to GPU: {e}")
+                continue # Skip this update if something goes wrong
+            # ===============================================
 
             update_start_time = time.time()
             
@@ -229,16 +264,18 @@ class PPO_Trainer:
                     end = start + self.config['batch_size']
                     mb_indices = b_indices[start:end]
                     
-                    mb_obs = torch.FloatTensor(b_obs[mb_indices]).to(self.device)
-                    mb_actions = torch.LongTensor(b_actions[mb_indices]).to(self.device)
-                    mb_log_probs = torch.FloatTensor(b_log_probs[mb_indices]).to(self.device)
-                    mb_advantages = torch.FloatTensor(b_advantages[mb_indices]).to(self.device)
-                    mb_returns = torch.FloatTensor(b_returns[mb_indices]).to(self.device)
+                    # === OPTIMIZATION 2: 直接从GPU Tensor切片 ===
+                    mb_obs = b_obs_gpu[mb_indices]
+                    mb_actions = b_actions_gpu[mb_indices]
+                    mb_log_probs = b_log_probs_gpu[mb_indices]
+                    mb_advantages = b_advantages_gpu[mb_indices]
+                    mb_returns = b_returns_gpu[mb_indices]
+                    # ===============================================
 
+                    # 自动混合精度上下文
                     with torch.cuda.amp.autocast(enabled=(self.device.type == 'cuda')):
                         action_probs, state_values = self.model(mb_obs)
                         dist = Categorical(action_probs)
-                        # Re-compute log_probs and entropy for the current policy
                         new_log_probs = dist.log_prob(mb_actions)
                         entropy = dist.entropy()
                         
@@ -248,10 +285,18 @@ class PPO_Trainer:
                         surr2 = torch.clamp(ratio, 1.0 - self.config['clip_epsilon'], 1.0 + self.config['clip_epsilon']) * mb_advantages
                         actor_loss = -torch.min(surr1, surr2).mean()
 
-                        critic_loss = (mb_returns - state_values.squeeze()).pow(2).mean()
+                        # 确保state_values是正确的形状以进行广播
+                        state_values = state_values.squeeze()
+                        if state_values.shape != mb_returns.shape:
+                           # 临时调试信息
+                           # print(f"Shape mismatch: returns {mb_returns.shape}, values {state_values.shape}")
+                           state_values = state_values.view_as(mb_returns)
+
+                        critic_loss = (mb_returns - state_values).pow(2).mean()
                         loss = actor_loss + self.config['value_coef'] * critic_loss - self.config['entropy_coef'] * entropy.mean()
 
-                    self.optimizer.zero_grad()
+                    # 梯度更新
+                    self.optimizer.zero_grad(set_to_none=True)
                     self.scaler.scale(loss).backward()
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
                     self.scaler.step(self.optimizer)
@@ -259,6 +304,7 @@ class PPO_Trainer:
             
             update_end_time = time.time()
 
+            # 日志记录
             avg_reward_per_episode = np.sum(rewards_np) / (np.sum(dones_np) + 1e-8)
             self.writer.add_scalar("charts/avg_episode_reward", avg_reward_per_episode, global_step)
             self.writer.add_scalar("losses/value_loss", critic_loss.item(), global_step)
@@ -268,6 +314,7 @@ class PPO_Trainer:
             sps = int(self.config['num_steps_per_collect'] * self.config['num_envs'] / (update_end_time - collection_start_time))
             print(f"Global Step: {global_step}, SPS: {sps}, Avg Reward/Ep: {avg_reward_per_episode:.2f}, Update Time: {update_end_time-update_start_time:.2f}s, Collect Time: {collection_end_time-collection_start_time:.2f}s")
 
+            # 模型保存
             if update % self.config['save_freq_updates'] == 0:
                 save_path = os.path.join(self.config['output_dir'], f"gollum_policy_step_{global_step}.pth")
                 torch.save(self.model.state_dict(), save_path)
