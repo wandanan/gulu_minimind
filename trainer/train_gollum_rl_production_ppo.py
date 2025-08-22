@@ -1,4 +1,5 @@
 # minimind/trainer/train_gollum_rl_production_ppo.py
+# --- FINAL & COMPLETE VERSION ---
 
 import os
 import sys
@@ -9,7 +10,7 @@ import numpy as np
 from torch.distributions import Categorical
 from torch.utils.tensorboard import SummaryWriter
 import multiprocessing as mp
-import sys # <--- 添加这一行
+
 # 添加项目根目录到Python路径
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
@@ -18,6 +19,10 @@ if project_root not in sys.path:
 from environments.gollum_env import GollumEnv
 from model.model_ltc_gollum import LTCGollumConfig, ActorCriticLTC
 
+# =======================================================
+# Part 1: Helper function for multiprocessing
+# =======================================================
+
 def make_env():
     """
     一个可被pickle的顶级函数，用于创建GollumEnv实例。
@@ -25,27 +30,34 @@ def make_env():
     """
     return GollumEnv()
 
-# --- 1. 并行环境工作函数 (在独立的进程中运行) ---
+# =======================================================
+# Part 2: Vectorized Environment Wrapper
+# =======================================================
+
 def worker(remote, parent_remote, env_fn):
     parent_remote.close()
     env = env_fn()
     while True:
-        cmd, data = remote.recv()
-        if cmd == 'step':
-            obs, reward, terminated, truncated, info = env.step(data)
-            if terminated or truncated:
+        try:
+            cmd, data = remote.recv()
+            if cmd == 'step':
+                obs, reward, terminated, truncated, info = env.step(data)
+                if terminated or truncated:
+                    obs, info = env.reset()
+                remote.send((obs, reward, terminated, truncated, info))
+            elif cmd == 'reset':
                 obs, info = env.reset()
-            remote.send((obs, reward, terminated, truncated, info))
-        elif cmd == 'reset':
-            obs, info = env.reset()
-            remote.send((obs, info))
-        elif cmd == 'close':
-            remote.close()
+                remote.send((obs, info))
+            elif cmd == 'close':
+                remote.close()
+                break
+            elif cmd == 'get_spaces':
+                remote.send((env.observation_space, env.action_space))
+            else:
+                raise NotImplementedError
+        except EOFError:
             break
-        else:
-            raise NotImplementedError
 
-# --- 2. 并行环境包装器 (主进程中的控制器) ---
 class SubprocVecEnv:
     def __init__(self, env_fns):
         self.waiting = False
@@ -90,122 +102,126 @@ class SubprocVecEnv:
             p.join()
         self.closed = True
         
+    def get_spaces(self):
+        self.remotes[0].send(('get_spaces', None))
+        observation_space, action_space = self.remotes[0].recv()
+        return observation_space, action_space
+
     @property
     def num_envs(self):
         return len(self.remotes)
 
-# --- 3. 生产级PPO训练器 ---
+# =======================================================
+# Part 3: The PPO Trainer Class
+# =======================================================
+
 class PPO_Trainer:
     def __init__(self, config):
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # 初始化TensorBoard
         self.writer = SummaryWriter(log_dir=self.config['log_dir'])
-        
-        # ==================== 关键修改 ====================
-        # 用可pickle的 make_env 函数替换 lambda
-        # 旧代码: env_fns = [lambda: GollumEnv() for _ in range(self.config['num_envs'])]
+        print(f"TensorBoard logs will be saved to: {self.config['log_dir']}")
+
+        print("Creating subprocess vectorized environments...")
         env_fns = [make_env for _ in range(self.config['num_envs'])]
-        # ===============================================
-        
         self.envs = SubprocVecEnv(env_fns)
-
-        # 初始化模型和优化器
-        ltc_config = LTCGollumConfig()
-        self.model = ActorCriticLTC(ltc_config, num_actions=self.envs.remotes[0].recv()[1]['action_space'].n).to(self.device)
+        print(f"{self.config['num_envs']} parallel environments created.")
+        
+        obs_space, act_space = self.envs.get_spaces()
+        self.obs_shape = obs_space.shape
+        self.num_actions = act_space.n
+        print(f"Environment specs: num_actions={self.num_actions}, obs_shape={self.obs_shape}")
+        
+        ltc_config = LTCGollumConfig(input_size=self.obs_shape[0])
+        self.model = ActorCriticLTC(ltc_config, num_actions=self.num_actions).to(self.device)
+        
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.config['learning_rate'], eps=1e-5)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.device.type == 'cuda'))
 
-        # 混合精度训练 scaler
-        self.scaler = torch.cuda.amp.GradScaler()
-
-        # 加载预训练模型
         if self.config['pretrained_path'] and os.path.exists(self.config['pretrained_path']):
-            try:
-                self.model.load_pretrained_core(self.config['pretrained_path'])
-                print(f"Successfully loaded pretrained core from {self.config['pretrained_path']}")
-            except Exception as e:
-                print(f"Could not load pretrained model: {e}. Training from scratch.")
+            self.model.load_pretrained_core(self.config['pretrained_path'])
         else:
             print("Warning: Pretrained model not found or path not specified. Training from scratch.")
 
     def compute_advantages_gae(self, rewards, values, dones, gamma, gae_lambda):
-        num_steps, num_envs = rewards.shape
+        num_steps = rewards.shape[0]
         advantages = np.zeros_like(rewards)
         last_advantage = 0
         
         for t in reversed(range(num_steps)):
-            if t == num_steps - 1:
-                next_non_terminal = 1.0 - dones[-1] # 使用最后一步的dones
-                next_values = values[-1]
-            else:
-                next_non_terminal = 1.0 - dones[t]
-                next_values = values[t + 1]
-
+            next_non_terminal = 1.0 - dones[t]
+            next_values = values[t + 1]
             delta = rewards[t] + gamma * next_values * next_non_terminal - values[t]
             last_advantage = delta + gamma * gae_lambda * next_non_terminal * last_advantage
             advantages[t] = last_advantage
             
-        returns = advantages + values[:-1] # values has one more element
+        returns = advantages + values[:-1]
         return advantages, returns
 
     def train(self):
-        print(f"--- Starting PPO Training on {self.device} with {self.config['num_envs']} parallel environments ---")
+        print(f"--- Starting PPO Training on {self.device} ---")
         start_time = time.time()
         
-        # 初始化存储
-        obs_shape = (self.config['num_steps_per_collect'], self.config['num_envs']) + self.envs.reset()[0].shape[1:]
+        # === Correct Initialization of Storage Arrays ===
+        obs_shape = (self.config['num_steps_per_collect'], self.config['num_envs']) + self.obs_shape
         obs_np = np.zeros(obs_shape, dtype=np.float32)
         actions_np = np.zeros((self.config['num_steps_per_collect'], self.config['num_envs']), dtype=np.int64)
         log_probs_np = np.zeros((self.config['num_steps_per_collect'], self.config['num_envs']), dtype=np.float32)
         rewards_np = np.zeros((self.config['num_steps_per_collect'], self.config['num_envs']), dtype=np.float32)
         dones_np = np.zeros((self.config['num_steps_per_collect'], self.config['num_envs']), dtype=np.float32)
         values_np = np.zeros((self.config['num_steps_per_collect'] + 1, self.config['num_envs']), dtype=np.float32)
+        # =================================================
 
         global_step = 0
         num_updates = self.config['total_timesteps'] // (self.config['num_steps_per_collect'] * self.config['num_envs'])
         
+        print("Initial reset of environments...")
         next_obs, _ = self.envs.reset()
+        next_done = np.zeros(self.config['num_envs'])
+        print("Initial reset complete. Starting training loop...")
 
         for update in range(1, num_updates + 1):
+            print(f"\n--- Update {update}/{num_updates} ---")
+            collection_start_time = time.time()
+            
             for step in range(self.config['num_steps_per_collect']):
                 global_step += 1 * self.config['num_envs']
                 obs_np[step] = next_obs
+                dones_np[step] = next_done
                 
                 with torch.no_grad():
                     obs_tensor = torch.FloatTensor(next_obs).to(self.device)
                     action, log_prob, value = self.model.get_action_and_value(obs_tensor)
                 
+                values_np[step] = value.cpu().numpy().flatten()
                 actions_np[step] = action.cpu().numpy()
                 log_probs_np[step] = log_prob.cpu().numpy()
-                values_np[step] = value.cpu().numpy().flatten()
 
                 self.envs.step_async(action.cpu().numpy())
-                next_obs, reward, terminated, truncated, _ = self.envs.step_wait()
-                
+                next_obs, reward, terminated, truncated, infos = self.envs.step_wait()
+                next_done = np.logical_or(terminated, truncated)
                 rewards_np[step] = reward
-                dones_np[step] = np.logical_or(terminated, truncated)
             
-            # 计算最后一步的价值
+            collection_end_time = time.time()
+            
             with torch.no_grad():
                 next_obs_tensor = torch.FloatTensor(next_obs).to(self.device)
                 _, _, next_value = self.model.get_action_and_value(next_obs_tensor)
                 values_np[-1] = next_value.cpu().numpy().flatten()
             
-            # 计算优势和回报
             advantages, returns = self.compute_advantages_gae(rewards_np, values_np, dones_np, self.config['gamma'], self.config['gae_lambda'])
             
-            # 扁平化数据以进行mini-batch更新
-            b_obs = obs_np.reshape((-1,) + obs_shape[2:])
-            b_actions = actions_np.flatten()
+            b_obs = obs_np.reshape((-1,) + self.obs_shape)
             b_log_probs = log_probs_np.flatten()
+            b_actions = actions_np.flatten()
             b_advantages = advantages.flatten()
             b_returns = returns.flatten()
 
-            # 归一化优势
             b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
-            # PPO 更新循环
+            update_start_time = time.time()
+            
             b_indices = np.arange(len(b_obs))
             for epoch in range(self.config['num_updates_per_collect']):
                 np.random.shuffle(b_indices)
@@ -219,12 +235,13 @@ class PPO_Trainer:
                     mb_advantages = torch.FloatTensor(b_advantages[mb_indices]).to(self.device)
                     mb_returns = torch.FloatTensor(b_returns[mb_indices]).to(self.device)
 
-                    with torch.cuda.amp.autocast():
+                    with torch.cuda.amp.autocast(enabled=(self.device.type == 'cuda')):
                         action_probs, state_values = self.model(mb_obs)
                         dist = Categorical(action_probs)
+                        # Re-compute log_probs and entropy for the current policy
                         new_log_probs = dist.log_prob(mb_actions)
-                        entropy = dist.entropy().mean()
-
+                        entropy = dist.entropy()
+                        
                         ratio = torch.exp(new_log_probs - mb_log_probs)
 
                         surr1 = ratio * mb_advantages
@@ -232,78 +249,68 @@ class PPO_Trainer:
                         actor_loss = -torch.min(surr1, surr2).mean()
 
                         critic_loss = (mb_returns - state_values.squeeze()).pow(2).mean()
-                        
-                        loss = actor_loss + self.config['value_coef'] * critic_loss - self.config['entropy_coef'] * entropy
+                        loss = actor_loss + self.config['value_coef'] * critic_loss - self.config['entropy_coef'] * entropy.mean()
 
                     self.optimizer.zero_grad()
                     self.scaler.scale(loss).backward()
-                    self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+            
+            update_end_time = time.time()
 
-            # --- 日志记录 ---
-            self.writer.add_scalar("charts/avg_episode_reward", np.sum(rewards_np) / (np.sum(dones_np) + 1e-8), global_step)
+            avg_reward_per_episode = np.sum(rewards_np) / (np.sum(dones_np) + 1e-8)
+            self.writer.add_scalar("charts/avg_episode_reward", avg_reward_per_episode, global_step)
             self.writer.add_scalar("losses/value_loss", critic_loss.item(), global_step)
             self.writer.add_scalar("losses/policy_loss", actor_loss.item(), global_step)
-            self.writer.add_scalar("losses/entropy", entropy.item(), global_step)
+            self.writer.add_scalar("losses/entropy", entropy.mean().item(), global_step)
             
-            sps = int(global_step / (time.time() - start_time))
-            print(f"Global Step: {global_step}, SPS: {sps}, Avg Reward: {np.sum(rewards_np) / (np.sum(dones_np) + 1e-8):.2f}")
+            sps = int(self.config['num_steps_per_collect'] * self.config['num_envs'] / (update_end_time - collection_start_time))
+            print(f"Global Step: {global_step}, SPS: {sps}, Avg Reward/Ep: {avg_reward_per_episode:.2f}, Update Time: {update_end_time-update_start_time:.2f}s, Collect Time: {collection_end_time-collection_start_time:.2f}s")
 
-            # --- 模型保存 ---
             if update % self.config['save_freq_updates'] == 0:
                 save_path = os.path.join(self.config['output_dir'], f"gollum_policy_step_{global_step}.pth")
                 torch.save(self.model.state_dict(), save_path)
+                print(f"Model saved to {save_path}")
         
         self.envs.close()
         self.writer.close()
         print("--- PPO Training Finished ---")
 
-# --- 4. 主函数入口 ---
+# =======================================================
+# Part 4: Main execution block
+# =======================================================
+
 if __name__ == "__main__":
-    # --- 最佳配置 ---
-    # 根据你的25核CPU和A10 GPU，这是一个推荐的生产级配置
     config = {
-        "num_envs": 20,                          # 使用20个CPU核心进行并行数据收集
-        "total_timesteps": 5_000_000,            # 增加训练总步数，让咕噜学习更充分
-        "num_steps_per_collect": 2048,           # 每次每个环境收集的步数
-        "num_updates_per_collect": 10,           # 每次收集后，对数据进行优化的轮数
-        "batch_size": 64,                        # Mini-batch大小，保持较小以获得更好的泛化
-        "learning_rate": 2.5e-4,                 # 经典的PPO学习率
-        "gamma": 0.99,                           # 折扣因子
-        "gae_lambda": 0.95,                      # GAE lambda参数
-        "clip_epsilon": 0.2,                     # PPO裁剪参数
-        "value_coef": 0.5,                       # 价值损失的系数
-        "entropy_coef": 0.01,                    # 熵奖励的系数，鼓励探索
-        "log_dir": "runs/gollum_ppo_prod",       # TensorBoard日志目录
-        "output_dir": "checkpoints/gollum_ppo_prod", # 模型保存目录
-        "save_freq_updates": 50,                 # 每隔多少次大更新就保存一次模型
+        "num_envs": 20,
+        "total_timesteps": 5_000_000,
+        "num_steps_per_collect": 2048,
+        "num_updates_per_collect": 10,
+        "batch_size": 64,
+        "learning_rate": 2.5e-4,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "clip_epsilon": 0.2,
+        "value_coef": 0.5,
+        "entropy_coef": 0.01,
+        "log_dir": "runs/gollum_ppo_prod",
+        "output_dir": "checkpoints/gollum_ppo_prod",
+        "save_freq_updates": 50,
         "pretrained_path": "checkpoints/gollum_sl/gollum_instinct_core.pth"
     }
     
     os.makedirs(config['output_dir'], exist_ok=True)
     
-    # ==================== 智能的多进程启动设置 ====================
-    # 检查操作系统平台
-    # sys.platform == 'win32' 表示 Windows
-    # sys.platform == 'linux' 表示 Linux
-    # sys.platform == 'darwin' 表示 macOS
     if sys.platform != 'win32':
-        # 在 Linux 或 macOS 上，'forkserver' 是更高效、更安全的选择
-        # 确认 'forkserver' 可用
         if 'forkserver' in mp.get_all_start_methods():
-            mp.set_start_method("forkserver")
+            mp.set_start_method("forkserver", force=True)
             print("INFO: Using 'forkserver' for multiprocessing (Linux/macOS optimized).")
         else:
-            # 如果 'forkserver' 不可用，回退到 'fork'
-            mp.set_start_method("fork")
+            mp.set_start_method("fork", force=True)
             print("INFO: 'forkserver' not available, using 'fork' for multiprocessing.")
     else:
-        # 在 Windows 上，'spawn' 是唯一且默认的选项。
-        # 我们无需做任何事，只需确保后续代码在 __main__ 块内。
         print("INFO: Using default 'spawn' for multiprocessing (Windows compatible).")
-    # =============================================================
 
     trainer = PPO_Trainer(config)
     trainer.train()
