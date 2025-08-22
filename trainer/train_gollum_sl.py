@@ -46,7 +46,7 @@ def main():
     # --- 配置参数 ---
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     epochs = 100
-    batch_size = 512
+    batch_size = 64
     learning_rate = 1e-3
     output_dir = "checkpoints/gollum_sl"
     log_file = os.path.join(output_dir, "train_log.txt")
@@ -61,17 +61,17 @@ def main():
     model = LTCGollum(config)
     model.to(device)
     # 检查PyTorch版本后，启用编译
-    if torch.__version__[0] == '2':
-        logger.log("PyTorch 2.0+ detected, compiling the model...")
-        model = torch.compile(model)
+    # if torch.__version__[0] == '2':
+    #     logger.log("PyTorch 2.0+ detected, compiling the model...")
+    #     model = torch.compile(model)
         
     logger.log(f"Model created with {sum(p.numel() for p in model.parameters())} parameters.")
         # --- 准备数据 ---
     logger.log("Loading dataset...")
     train_dataset = GollumDataset('dataset/gollum_dataset_train.npz')
     val_dataset = GollumDataset('dataset/gollum_dataset_val.npz')
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=6, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=6, pin_memory=True)
 
     # --- 定义优化器和损失函数 ---
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
