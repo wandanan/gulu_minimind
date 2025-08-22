@@ -17,7 +17,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from environments.gollum_env import GollumEnv
-from model.model_ltc_gollum import LTCGollumConfig, ActorCriticLTC
+from model.model_ltc_gollum_rl import LTCGollumConfig, ActorCriticLTC
 
 # =======================================================
 # Part 1: Helper function for multiprocessing
