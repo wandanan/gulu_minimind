@@ -134,32 +134,16 @@ class PPO_Trainer:
         print(f"Environment specs: num_actions={self.num_actions}, obs_shape={self.obs_shape}")
         
         ltc_config = LTCGollumConfig(input_size=self.obs_shape[0])
-        # 1. 先在CPU上创建原始模型
-        model = ActorCriticLTC(ltc_config, num_actions=self.num_actions)
+        # 模型创建和移动到设备，没有JIT
+        self.model = ActorCriticLTC(ltc_config, num_actions=self.num_actions).to(self.device)
         
-        # 2. 如果有预训练权重，先在CPU上加载
-        if self.config['pretrained_path'] and os.path.exists(self.config['pretrained_path']):
-            # 注意：这里加载权重时，模型和权重都在CPU上，避免JIT的复杂性
-            model.load_pretrained_core(self.config['pretrained_path'])
-        else:
-            print("Warning: Pretrained model not found or path not specified. Training from scratch.")
-        
-        # 3. 将加载好权重的模型移动到目标设备
-        model.to(self.device)
-
-        # 4. 【关键优化】对已经加载了权重并移动到设备上的模型实例进行JIT编译
-        try:
-            print("Attempting to JIT compile the model...")
-            # torch.jit.script 接收一个nn.Module实例，返回优化后的版本
-            self.model = torch.jit.script(model)
-            print("Model successfully JIT compiled!")
-        except Exception as e:
-            print(f"Warning: JIT compilation failed: {e}. Proceeding without JIT.")
-            self.model = model # 如果编译失败，使用原始的、未经优化的模型
-        
-        # 5. 最后为可能已被JIT编译的模型设置优化器
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.config['learning_rate'], eps=1e-5)
         self.scaler = torch.cuda.amp.GradScaler(enabled=(self.device.type == 'cuda'))
+
+        if self.config['pretrained_path'] and os.path.exists(self.config['pretrained_path']):
+            self.model.load_pretrained_core(self.config['pretrained_path'])
+        else:
+            print("Warning: Pretrained model not found or path not specified. Training from scratch.")
 
     def compute_advantages_gae(self, rewards, values, dones, gamma, gae_lambda):
         num_steps = rewards.shape[0]

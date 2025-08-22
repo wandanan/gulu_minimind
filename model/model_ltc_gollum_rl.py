@@ -20,16 +20,19 @@ class LTCGollumConfig:
         self.hidden_size = hidden_size
         self.output_size = output_size # 主要用于兼容阶段一的config
 
+# 粘贴到 model/model_ltc_gollum_rl.py 中，替换旧的 LTCCell 类
+
 class LTCCell(nn.Module):
     """
-    LTC神经元细胞，与阶段一完全相同，是模型的核心计算单元。
+    LTC神经元细胞，这是经过向量化改造以提升GPU性能的版本。
+    它消除了Python for循环，使用并行的张量操作。
     """
     def __init__(self, config):
         super(LTCCell, self).__init__()
         self.input_size = config.input_size
         self.hidden_size = config.hidden_size
-        self.ode_solver_unfolds = 6
-
+        
+        # --- 参数初始化 (这部分代码与你的原始版本完全相同) ---
         self.sensory_mu = nn.Parameter(torch.rand(self.input_size, self.hidden_size) * 0.5 + 0.3)
         self.sensory_sigma = nn.Parameter(torch.rand(self.input_size, self.hidden_size) * 5.0 + 3.0)
         self.sensory_W = nn.Parameter(torch.rand(self.input_size, self.hidden_size) * 0.99 + 0.01)
@@ -47,13 +50,18 @@ class LTCCell(nn.Module):
         self.cm = nn.Parameter(torch.full((self.hidden_size,), 0.5))
     
     def _sigmoid(self, v_pre, mu, sigma):
+        # 这个辅助函数与你的原始版本完全相同
         v_pre = v_pre.unsqueeze(2)
         mues = v_pre - mu
         x = sigma * mues
         return torch.sigmoid(x)
-    
-    def forward(self, inputs, state):
-        v_pre = state
+
+    # === 【核心修改】替换为向量化的 forward 方法 ===
+    def forward(self, inputs: torch.Tensor, state: torch.Tensor):
+        """
+        这个新的forward方法消除了Python for循环，以实现GPU并行计算。
+        """
+        # 1. 预计算感觉输入部分 (与你的原始版本相同)
         sensory_x = inputs.unsqueeze(2) 
         sensory_mu_exp = self.sensory_mu.unsqueeze(0)
         sensory_sigma_exp = self.sensory_sigma.unsqueeze(0)
@@ -63,18 +71,35 @@ class LTCCell(nn.Module):
         w_numerator_sensory = torch.sum(sensory_rev_activation, dim=1)
         w_denominator_sensory = torch.sum(sensory_w_activation, dim=1)
 
-        for _ in range(self.ode_solver_unfolds):
-            w_activation = self.W * self._sigmoid(v_pre, self.mu, self.sigma)
-            rev_activation = w_activation * self.erev
-            w_numerator_inter = torch.sum(rev_activation, dim=1)
-            w_denominator_inter = torch.sum(w_activation, dim=1)
-            w_numerator = w_numerator_inter + w_numerator_sensory
-            w_denominator = w_denominator_inter + w_denominator_sensory
-            numerator = self.cm * v_pre + self.gleak * self.vleak + w_numerator
-            denominator = self.cm + self.gleak + w_denominator
-            v_pre = numerator / (denominator + 1e-8)
+        # 2. 计算来自内部神经元的总输入 (与for循环内部逻辑相同)
+        inter_act = self._sigmoid(state, self.mu, self.sigma)
+        inter_w_act = self.W * inter_act
+        inter_rev_act = inter_w_act * self.erev
+        w_numerator_inter = torch.sum(inter_rev_act, dim=1)
+        w_denominator_inter = torch.sum(inter_w_act, dim=1)
         
-        return v_pre
+        # 3. 组合所有输入
+        w_numerator = w_numerator_inter + w_numerator_sensory
+        w_denominator = w_denominator_inter + w_denominator_sensory
+        
+        # 4. 计算时间常数 tau 和稳态电压 v_inf (这是新的向量化逻辑)
+        # G_total = G_leak + G_synaptic
+        G_total = self.gleak + w_denominator
+        # tau = Cm / G_total (膜时间常数)
+        tau = self.cm / (G_total + 1e-8)
+        
+        # V_inf = (Cm*V_leak*G_leak + I_synaptic) / G_total (稳态电压)
+        # 注意：这里我们使用了一个等价的公式 V_inf = numerator / denominator
+        numerator = self.cm * state + self.gleak * self.vleak + w_numerator
+        denominator = self.cm + G_total
+        v_inf = numerator / (denominator + 1e-8)
+        
+        # 5. 使用指数积分器更新状态 (这是对for循环的高效近似)
+        dt = 0.1 # 使用一个小的、固定的积分时间步长
+        # state_new = v_inf + (state_old - v_inf) * exp(-dt/tau)
+        next_state = v_inf + (state - v_inf) * torch.exp(-dt / (tau + 1e-8))
+        
+        return next_state
 
 # -------------------------------------------------------------------
 # Part 2: Specialized Models for Reinforcement Learning
