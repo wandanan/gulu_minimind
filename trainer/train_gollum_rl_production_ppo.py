@@ -322,36 +322,51 @@ class PPO_Trainer:
 # Part 4: Main execution block
 # =======================================================
 
-if __name__ == "__main__":
+def main():
+    """
+    主函数，封装了所有的设置和训练启动逻辑。
+    """
+    # 启用异常检测，这会显著降低性能，但能提供详细的错误回溯
+    # 在我们彻底解决NaN问题之前，保持开启
+    torch.autograd.set_detect_anomaly(True)
+
     config = {
-        "num_envs": 20,
+        "num_envs": 8, # 为了更快的调试，暂时减少并行环境数量
         "total_timesteps": 5_000_000,
         "num_steps_per_collect": 2048,
-        "num_updates_per_collect": 5,
+        "num_updates_per_collect": 5, # 使用我们之前讨论的更稳定的值
         "batch_size": 64,
-        "learning_rate": 3e-5,
+        "learning_rate": 3e-5, # 使用我们之前讨论的更稳定的值
         "gamma": 0.99,
         "gae_lambda": 0.95,
         "clip_epsilon": 0.2,
         "value_coef": 0.5,
-        "entropy_coef": 0.02,
-        "log_dir": "runs/gollum_ppo_prod",
-        "output_dir": "checkpoints/gollum_ppo_prod",
+        "entropy_coef": 0.01, # 熵奖励暂时保持不变
+        "log_dir": "runs/gollum_ppo_prod_debug", # 使用新的日志目录
+        "output_dir": "checkpoints/gollum_ppo_prod_debug", # 使用新的输出目录
         "save_freq_updates": 50,
         "pretrained_path": "checkpoints/gollum_sl/gollum_instinct_core.pth"
     }
     
     os.makedirs(config['output_dir'], exist_ok=True)
     
+    trainer = PPO_Trainer(config)
+    trainer.train()
+
+
+if __name__ == "__main__":
+    # 设置多进程启动方法 (这部分也应该在保护块内)
     if sys.platform != 'win32':
         if 'forkserver' in mp.get_all_start_methods():
             mp.set_start_method("forkserver", force=True)
             print("INFO: Using 'forkserver' for multiprocessing (Linux/macOS optimized).")
         else:
-            mp.set_start_method("fork", force=True)
+            # 对于某些环境，'fork' 可能导致CUDA问题，'forkserver' 或 'spawn' 更安全
+            mp.set_start_method("fork", force=True) 
             print("INFO: 'forkserver' not available, using 'fork' for multiprocessing.")
     else:
+        # Windows 必须使用 'spawn'，并且所有启动代码必须在 if __name__ == '__main__' 下
         print("INFO: Using default 'spawn' for multiprocessing (Windows compatible).")
 
-    trainer = PPO_Trainer(config)
-    trainer.train()
+    # 调用主函数
+    main()
